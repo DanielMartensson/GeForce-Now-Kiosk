@@ -1,15 +1,15 @@
+#define _GNU_SOURCE
+
 // GeForce-Now-Kiosk — minimal WPE WebKit kiosk for Nvidia GeForce Now.
 //
-// Pure C11.  Two builds:
+// Pure C11.  Two mutually exclusive builds (no fallback at runtime):
 //
 //   cmake -DIMFN_TARGET=ON   →  DRM/KMS only (STM32MP257F, no X11, no GL)
-//   cmake -DIMFN_TARGET=OFF  →  DRM/KMS primary, X11+EGL+GLES3 fallback
+//   cmake -DIMFN_TARGET=OFF  →  X11+EGL+GLES3 only (desktop DEV)
 //
 // Feature flags (set below based on TARGET):
-//   HAS_DRM      — DRM/KMS page flip via GBM (always on)
-//   HAS_X11      — X11 window system for desktop fallback
-//   HAS_GLES     — OpenGL ES for X11 fullscreen blit
-//   HAS_GL_IMAGE — glEGLImageTargetTexture2DOES for EGLImage→texture
+//   HAS_DRM  — DRM/KMS page flip via GBM (TARGET build)
+//   HAS_X11  — X11 window system with EGL+GLES3 blit (DEV build)
 //
 // Render path:
 //   WebKit composites → wpebackend-fdo exports dmabuf-backed EGLImage
@@ -19,119 +19,111 @@
 // Quit: Ctrl+Q.
 
 // ---------------------------------------------------------------------------
-// Feature flags — set to 1 or 0 based on build target.
+// Feature flags — set to 1 or 0 based on build target (exactly one backend).
 // ---------------------------------------------------------------------------
 #ifdef TARGET
-#define HAS_DRM      1
-#define HAS_X11       0
-#define HAS_GLES      0
-#define HAS_GL_IMAGE  0
+#define HAS_DRM 1
+#define HAS_X11  0
 #else
-#define HAS_DRM      1
-#define HAS_X11       1
-#define HAS_GLES      1
-#define HAS_GL_IMAGE  1
+#define HAS_DRM 0
+#define HAS_X11  1
 #endif
 
 // ---------------------------------------------------------------------------
-// Includes — only pull in what the feature flags require.
+// Includes — only pull in what the build target requires.
 // ---------------------------------------------------------------------------
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
-#include <GBM/gbm.h>
-#include <linux/input.h>
-#include <wpe/webkit.h>
+#include <stdbool.h>
 #include <wpe/fdo-egl.h>
+#include <wpe/fdo.h>
+#include <wpe/webkit.h>
 #include <xkbcommon/xkbcommon-keysyms.h>
+#include <xkbcommon/xkbcommon.h>
 
 #if HAS_DRM
+#if __has_include(<GBM/gbm.h>)
+#include <GBM/gbm.h>
+#else
+#include <gbm.h>
+#endif
+#include <drm_fourcc.h>
+#include <linux/input.h>
+#include <poll.h>
+#include <sys/ioctl.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
-#include <drm_fourcc.h>
 #endif
 
 #if HAS_X11
+#include <GLES3/gl3.h>
+#include <GLES2/gl2ext.h>
 #include <X11/Xlib.h>
 #include <X11/keysym.h>
 #endif
 
-#if HAS_GLES
-#include <GLES3/gl3.h>
-#include <GLES2/gl2ext.h>
-#endif
-
 #include <fcntl.h>
-#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/ioctl.h>
 #include <unistd.h>
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
+#if HAS_DRM
 typedef EGLBoolean (*PFN_eglExportDMABUFImageMESA)(EGLDisplay, EGLImageKHR,
-                                                    int *fds, EGLint *strides,
-                                                    EGLint *offsets);
-#if HAS_GL_IMAGE
+                                                   int *fds, EGLint *strides,
+                                                   EGLint *offsets);
+#endif
+
+#if HAS_X11
 typedef void (*PFN_glEGLImageTargetTexture2DOES)(GLenum target,
                                                  GLeglImageOES image);
 #endif
 
 typedef struct {
-    // --- EGL (display only — for dmabuf export) ---
-    EGLDisplay                   egl;
-    PFN_eglExportDMABUFImageMESA egl_export;
-
 #if HAS_DRM
-    // --- GBM (buffer import) ---
+    // --- GBM + DRM/KMS ---
+    EGLDisplay     egl;
     struct gbm_device *gbm;
-
-    // --- DRM/KMS ---
     int            drm_fd;
     uint32_t       crtc_id, connector_id, plane_id;
-    uint32_t       width, height;
-    uint32_t       format;
-    uint32_t       prop_fb_id, prop_src_w, prop_src_h;
-    uint32_t       prop_crtc_w, prop_crtc_h;
+    uint32_t       width, height, format;
+    uint32_t       prop_fb_id, prop_src_w, prop_src_h, prop_crtc_w, prop_crtc_h;
     struct gbm_bo *prev_bo;
     uint32_t       prev_fb_id;
     int            flip_pending;
-#endif
 
-#if HAS_X11
-    // --- X11 + EGL + GLES3 (desktop fallback) ---
+    // --- Evdev input ---
+    int      kbd_fd, mou_fd;
+    uint32_t mods;
+#else
+    // --- X11 + EGL + GLES3 ---
+    EGLDisplay  egl;
     Display    *x11_dpy;
     Window      x11_win;
     Atom        x11_wm_delete;
-    int         use_drm;
     EGLContext  egl_ctx;
     EGLSurface  egl_surface;
-#endif
-
-#if HAS_GL_IMAGE
+    uint32_t    width, height;
     GLuint      gl_tex, gl_prog;
     GLint       gl_u_tex;
-    PFN_glEGLImageTargetTexture2DOES gl_bind_image;
+    PFN_glEGLImageTargetTexture2DOES   gl_bind_image;
 #endif
 
     // --- WPE (common) ---
     struct wpe_view_backend_exportable_fdo *exportable;
     struct wpe_view_backend               *backend;
     WebKitWebView                         *view;
-    wpe_fdo_egl_exported_image *displayed;
-    wpe_fdo_egl_exported_image *pending;
-    wpe_fdo_egl_exported_image *retire;
-    int frame_pending, running, width, height;
+    struct wpe_fdo_egl_exported_image *displayed;
+    struct wpe_fdo_egl_exported_image *pending;
+    struct wpe_fdo_egl_exported_image *retire;
+    int frame_pending, running;
 
-    // --- Evdev (common) ---
-    int      kbd_fd, mou_fd;
-    uint32_t mods;
-
-    // --- xkbcommon ---
+    // --- xkbcommon (common) ---
     struct xkb_context *xkb_ctx;
     struct xkb_keymap  *xkb_keymap;
     struct xkb_state   *xkb_state;
@@ -140,30 +132,10 @@ typedef struct {
 static App g;
 
 // ---------------------------------------------------------------------------
-// DRM property lookup
+// Keysym mapping (evdev → XKB)
 // ---------------------------------------------------------------------------
 
-static uint32_t drm_prop(uint32_t obj, uint32_t type, const char *name)
-{
-    drmModeObjectProperties *p = drmModeObjectGetProperties(g.drm_fd, obj, type);
-    if (!p) return 0;
-    for (uint32_t i = 0; i < p->count_props; i++) {
-        drmModePropertyRes *pr = drmModeGetProperty(g.drm_fd, p->props[i]);
-        if (pr) {
-            int match = strcmp(pr->name, name) == 0;
-            uint32_t id = pr->prop_id;
-            drmModeFreeProperty(pr);
-            if (match) { drmModeFreeObjectProperties(p); return id; }
-        }
-    }
-    drmModeFreeObjectProperties(p);
-    return 0;
-}
-
-// ---------------------------------------------------------------------------
-// Keysym helpers (XKB keysym ↔ evdev / X11 KeySym)
-// ---------------------------------------------------------------------------
-
+#if HAS_DRM
 static uint32_t evdev_to_xkb(uint16_t c)
 {
     switch (c) {
@@ -199,7 +171,124 @@ static uint32_t evdev_to_xkb(uint16_t c)
     return 0;
 }
 
-#ifndef TARGET
+static int evdev_kb_sym(uint16_t code)
+{
+    uint32_t sym = evdev_to_xkb(code);
+    if (!sym || !g.xkb_keymap) return sym;
+    const xkb_keysym_t *s = NULL;
+    for (uint32_t kc = 8; kc < 256; kc++) {
+        int n = xkb_keymap_key_get_syms_by_level(g.xkb_keymap, kc, 0, 0, &s);
+        if (n > 0 && s && s[0] == (xkb_keysym_t)sym) return (int)kc;
+    }
+    return (int)(code + 8);
+}
+
+static void evdev_mod_set(uint16_t code, int pressed)
+{
+    uint32_t f = 0;
+    switch (code) {
+    case KEY_LEFTCTRL:  case KEY_RIGHTCTRL:  f = 0x04; break;
+    case KEY_LEFTSHIFT: case KEY_RIGHTSHIFT: f = 0x01; break;
+    case KEY_LEFTALT:   case KEY_RIGHTALT:   f = 0x08; break;
+    case KEY_LEFTMETA:  case KEY_RIGHTMETA:  f = 0x10; break;
+    }
+    if (f) { if (pressed) g.mods |= f; else g.mods &= ~f; }
+}
+
+// ---------------------------------------------------------------------------
+// Evdev input — keyboard and mouse from /dev/input/event*
+// ---------------------------------------------------------------------------
+
+static void evdev_kbd_read(void)
+{
+    struct input_event ev;
+    while (read(g.kbd_fd, &ev, sizeof ev) == (ssize_t)sizeof ev) {
+        if (ev.type != EV_KEY) continue;
+        evdev_mod_set(ev.code, ev.value);
+        uint32_t sym = evdev_to_xkb(ev.code);
+        if (!sym) continue;
+        if (ev.value == 1 && sym == XKB_KEY_q && (g.mods & 0x04)) {
+            g.running = 0;
+            return;
+        }
+        struct wpe_input_keyboard_event w = {
+            .time      = (uint32_t)(g_get_monotonic_time() / 1000),
+            .key_code  = sym,
+            .hardware_key_code = (uint32_t)evdev_kb_sym(ev.code),
+            .pressed   = ev.value ? 1 : 0,
+            .modifiers = g.mods,
+        };
+        wpe_view_backend_dispatch_keyboard_event(g.backend, &w);
+    }
+}
+
+static void evdev_mou_read(void)
+{
+    static int mx, my;
+    static uint32_t btn;
+    struct input_event ev;
+    while (read(g.mou_fd, &ev, sizeof ev) == (ssize_t)sizeof ev) {
+        if (ev.type == EV_REL) {
+            if (ev.code == REL_X) mx += ev.value;
+            if (ev.code == REL_Y) my += ev.value;
+            if (mx < 0) mx = 0;
+            if (mx > (int)g.width)  mx = (int)g.width;
+            if (my < 0) my = 0;
+            if (my > (int)g.height) my = (int)g.height;
+            struct wpe_input_pointer_event p = {
+                .type = wpe_input_pointer_event_type_motion,
+                .time = (uint32_t)(g_get_monotonic_time() / 1000),
+                .x = mx, .y = my, .state = btn,
+            };
+            wpe_view_backend_dispatch_pointer_event(g.backend, &p);
+        } else if (ev.type == EV_KEY && ev.code <= BTN_RIGHT) {
+            uint32_t b = 0;
+            if (ev.code == BTN_LEFT)   b = 1;
+            if (ev.code == BTN_RIGHT)  b = 2;
+            if (ev.code == BTN_MIDDLE) b = 3;
+            if (b) {
+                if (ev.value) btn |= 1u << (19 + b);
+                else         btn &= ~(1u << (19 + b));
+                struct wpe_input_pointer_event p = {
+                    .type = wpe_input_pointer_event_type_button,
+                    .time = (uint32_t)(g_get_monotonic_time() / 1000),
+                    .x = mx, .y = my, .button = b, .state = btn,
+                };
+                wpe_view_backend_dispatch_pointer_event(g.backend, &p);
+            }
+        }
+    }
+}
+
+static void evdev_init(void)
+{
+    g.kbd_fd = g.mou_fd = -1;
+    for (int i = 0; i < 16; i++) {
+        char path[32];
+        snprintf(path, sizeof path, "/dev/input/event%d", i);
+        int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        if (fd < 0) continue;
+        unsigned long bits[1 + KEY_MAX / (sizeof(long) * 8)] = {};
+        if (ioctl(fd, EVIOCGBIT(0, sizeof bits), bits) < 0) {
+            close(fd); continue;
+        }
+        int has_key = bits[1 + EV_KEY / 64] & (1UL << (EV_KEY % 64));
+        int has_rel = bits[1 + EV_REL / 64] & (1UL << (EV_REL % 64));
+        if (has_key && g.kbd_fd < 0) g.kbd_fd = fd;
+        else if (has_rel && g.mou_fd < 0) g.mou_fd = fd;
+        else close(fd);
+    }
+    fprintf(stderr, "evdev: kbd=%s  mou=%s\n",
+            g.kbd_fd  >= 0 ? "ok" : "none",
+            g.mou_fd  >= 0 ? "ok" : "none");
+}
+#endif // HAS_DRM
+
+// ---------------------------------------------------------------------------
+// Keysym mapping (X11 KeySym → XKB)
+// ---------------------------------------------------------------------------
+
+#if HAS_X11
 static uint32_t x11_to_xkb(KeySym ks)
 {
     switch (ks) {
@@ -223,131 +312,27 @@ static uint32_t x11_to_xkb(KeySym ks)
     if (ks >= 0x21 && ks <= 0x7e)    return (uint32_t)ks;
     return 0;
 }
-#endif
+#endif // HAS_X11
 
 // ---------------------------------------------------------------------------
-// Evdev input — keyboard and mouse from /dev/input/event*
+// WPE FDO export callbacks — called when WebKit has a new composited frame.
 // ---------------------------------------------------------------------------
 
-static void evdev_mod_set(uint16_t code, int pressed)
+static void frame_wrong_size(struct wpe_fdo_egl_exported_image *image)
 {
-    uint32_t f = 0;
-    switch (code) {
-    case KEY_LEFTCTRL:  case KEY_RIGHTCTRL:  f = 0x04; break;
-    case KEY_LEFTSHIFT: case KEY_RIGHTSHIFT: f = 0x01; break;
-    case KEY_LEFTALT:   case KEY_RIGHTALT:   f = 0x08; break;
-    case KEY_LEFTMETA:  case KEY_RIGHTMETA:  f = 0x10; break;
-    }
-    if (f) { if (pressed) g.mods |= f; else g.mods &= ~f; }
+    wpe_view_backend_exportable_fdo_dispatch_frame_complete(g.exportable);
+    wpe_view_backend_exportable_fdo_egl_dispatch_release_exported_image(
+        g.exportable, image);
 }
 
-static int evdev_kb_sym(uint16_t code)
-{
-    uint32_t sym = evdev_to_xkb(code);
-    if (!sym || !g.xkb_keymap) return sym;
-    const xkb_keysym_t *s = NULL;
-    for (uint32_t kc = 8; kc < 256; kc++) {
-        int n = xkb_keymap_key_get_syms_by_level(g.xkb_keymap, kc, 0, 0, &s);
-        if (n > 0 && s && s[0] == (xkb_keysym_t)sym) return (int)kc;
-    }
-    return (int)(code + 8);
-}
-
-static void evdev_kbd_read(void)
-{
-    struct input_event ev;
-    while (read(g.kbd_fd, &ev, sizeof ev) == (ssize_t)sizeof ev) {
-        if (ev.type != EV_KEY) continue;
-        evdev_mod_set(ev.code, ev.value);
-        uint32_t sym = evdev_to_xkb(ev.code);
-        if (!sym) continue;
-        if (ev.value == 1 && sym == XKB_KEY_q && (g.mods & 0x04)) {
-            g.running = 0;
-            return;
-        }
-        wpe_input_keyboard_event w = {
-            .time      = (uint32_t)(g_get_monotonic_time() / 1000),
-            .key_code  = sym,
-            .keyCode   = (uint32_t)evdev_kb_sym(ev.code),
-            .pressed   = ev.value ? 1 : 0,
-            .modifiers = g.mods,
-        };
-        wpe_view_backend_dispatch_keyboard_event(g.backend, &w);
-    }
-}
-
-static void evdev_mou_read(void)
-{
-    static int mx, my;
-    static uint32_t btn;
-    struct input_event ev;
-    while (read(g.mou_fd, &ev, sizeof ev) == (ssize_t)sizeof ev) {
-        if (ev.type == EV_REL) {
-            if (ev.code == REL_X) mx += ev.value;
-            if (ev.code == REL_Y) my += ev.value;
-            if (mx < 0) mx = 0; if (mx > g.width)  mx = g.width;
-            if (my < 0) my = 0; if (my > g.height)  my = g.height;
-            wpe_input_pointer_event p = {
-                .type = wpe_input_pointer_event_type_motion,
-                .time = (uint32_t)(g_get_monotonic_time() / 1000),
-                .x = mx, .y = my, .state = btn,
-            };
-            wpe_view_backend_dispatch_pointer_event(g.backend, &p);
-        } else if (ev.type == EV_KEY && ev.code <= BTN_RIGHT) {
-            uint32_t b = 0;
-            if (ev.code == BTN_LEFT)   b = 1;
-            if (ev.code == BTN_RIGHT)  b = 2;
-            if (ev.code == BTN_MIDDLE) b = 3;
-            if (b) {
-                if (ev.value) btn |= 1u << (19 + b);
-                else         btn &= ~(1u << (19 + b));
-                wpe_input_pointer_event p = {
-                    .type = wpe_input_pointer_event_type_button,
-                    .time = (uint32_t)(g_get_monotonic_time() / 1000),
-                    .x = mx, .y = my, .button = b, .state = btn,
-                };
-                wpe_view_backend_dispatch_pointer_event(g.backend, &p);
-            }
-        }
-    }
-}
-
-static void evdev_init(void)
-{
-    g.kbd_fd = g.mou_fd = -1;
-    for (int i = 0; i < 16; i++) {
-        char path[32];
-        snprintf(path, sizeof path, "/dev/input/event%d", i);
-        int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-        if (fd < 0) continue;
-        unsigned long bits[1 + KEY_MAX / (sizeof(long) * 8)] = {};
-        if (ioctl(fd, EVIOCGBIT(0, sizeof bits), bits) < 0) {
-            close(fd); continue;
-        }
-        int has_key  = bits[1 + EV_KEY  / 64] & (1UL << (EV_KEY  % 64));
-        int has_rel  = bits[1 + EV_REL  / 64] & (1UL << (EV_REL  % 64));
-        if (has_key && g.kbd_fd < 0) g.kbd_fd = fd;
-        else if (has_rel && g.mou_fd < 0) g.mou_fd = fd;
-        else close(fd);
-    }
-    fprintf(stderr, "evdev: kbd=%s  mou=%s\n",
-            g.kbd_fd  >= 0 ? "ok" : "none",
-            g.mou_fd  >= 0 ? "ok" : "none");
-}
-
-// ---------------------------------------------------------------------------
-// WPE FDO export callback — called when WebKit has a new composited frame.
-// ---------------------------------------------------------------------------
-
-static void on_egl_image(void *data, wpe_fdo_egl_exported_image *image)
+#if HAS_DRM
+static void on_egl_image(void *data, struct wpe_fdo_egl_exported_image *image)
 {
     (void)data;
 
-    if ((int)wpe_fdo_egl_exported_image_get_width(image)  != g.width ||
-        (int)wpe_fdo_egl_exported_image_get_height(image) != g.height) {
-        wpe_view_backend_exportable_fdo_dispatch_frame_complete(g.exportable);
-        wpe_view_backend_exportable_fdo_egl_dispatch_release_exported_image(
-            g.exportable, image);
+    if ((int)wpe_fdo_egl_exported_image_get_width(image)  != (int)g.width ||
+        (int)wpe_fdo_egl_exported_image_get_height(image) != (int)g.height) {
+        frame_wrong_size(image);
         return;
     }
 
@@ -363,81 +348,105 @@ static void on_egl_image(void *data, wpe_fdo_egl_exported_image *image)
             g.exportable, g.pending);
     g.pending = image;
 
-    // Export EGLImage → dmabuf fd (needed by both backends).
+    // Export EGLImage → dmabuf fd → GBM bo → page flip.
     EGLImageKHR egl_img = wpe_fdo_egl_exported_image_get_egl_image(image);
     int fd = -1;
     EGLint stride = 0;
-    if (!g.egl_export(g.egl, egl_img, &fd, &stride, NULL) || fd < 0)
-        goto done;
+    PFN_eglExportDMABUFImageMESA export =
+        (PFN_eglExportDMABUFImageMESA)eglGetProcAddress("eglExportDMABUFImageMESA");
+    if (!export || !export(g.egl, egl_img, &fd, &stride, NULL) || fd < 0)
+        goto failed;
 
-#ifndef TARGET
-    if (g.use_drm) {
-#endif
-        // --- DRM: dmabuf → GBM bo → page flip ---
-        if (!g.flip_pending) {
-            struct gbm_bo *bo = gbm_bo_import(
-                g.gbm, GBM_BO_IMPORT_FD,
-                &(struct gbm_import_fd_data){
-                    .fd     = fd,
-                    .width  = g.width,
-                    .height = g.height,
-                    .stride = (uint32_t)stride,
-                    .format = g.format,
-                }, GBM_BO_USE_SCANOUT);
-            if (bo) {
-                uint32_t handle = gbm_bo_get_handle(bo).u32;
-                uint32_t pitch  = gbm_bo_get_stride(bo);
-                uint32_t fb_id  = 0;
-                if (drmModeAddFB2(g.drm_fd, g.width, g.height, g.format,
-                                  &handle, &pitch, NULL, &fb_id, 0) == 0) {
-                    drmModeAtomicReq *req = drmModeAtomicAlloc();
-                    drmModeAtomicAddProperty(req, g.plane_id, g.prop_fb_id, fb_id);
-                    drmModeAtomicAddProperty(req, g.plane_id, g.prop_src_w,
-                        ((uint64_t)g.width << 32) | g.height);
-                    drmModeAtomicAddProperty(req, g.plane_id, g.prop_src_h,
-                        ((uint64_t)g.height << 32));
-                    drmModeAtomicAddProperty(req, g.plane_id, g.prop_crtc_w, g.width);
-                    drmModeAtomicAddProperty(req, g.plane_id, g.prop_crtc_h, g.height);
-                    if (drmModeAtomicCommit(g.drm_fd, req,
-                                            DRM_MODE_ATOMIC_NONBLOCK, &g) == 0) {
-                        g.prev_bo    = bo;
-                        g.prev_fb_id = fb_id;
-                        g.flip_pending = 1;
-                        goto done;
-                    }
-                    drmModeRmFB(g.drm_fd, fb_id);
-                    drmModeAtomicFree(req);
+    if (!g.flip_pending) {
+        struct gbm_bo *bo = gbm_bo_import(
+            g.gbm, GBM_BO_IMPORT_FD,
+            &(struct gbm_import_fd_data){
+                .fd     = fd,
+                .width  = g.width,
+                .height = g.height,
+                .stride = (uint32_t)stride,
+                .format = g.format,
+            }, GBM_BO_USE_SCANOUT);
+        if (bo) {
+            uint32_t handle = gbm_bo_get_handle(bo).u32;
+            uint32_t pitch  = gbm_bo_get_stride(bo);
+            uint32_t fb_id  = 0;
+            if (drmModeAddFB2(g.drm_fd, g.width, g.height, g.format,
+                              &handle, &pitch, NULL, &fb_id, 0) == 0) {
+                drmModeAtomicReq *req = drmModeAtomicAlloc();
+                drmModeAtomicAddProperty(req, g.plane_id, g.prop_fb_id, fb_id);
+                drmModeAtomicAddProperty(req, g.plane_id, g.prop_src_w,
+                    ((uint64_t)g.width << 32) | g.height);
+                drmModeAtomicAddProperty(req, g.plane_id, g.prop_src_h,
+                    ((uint64_t)g.height << 32));
+                drmModeAtomicAddProperty(req, g.plane_id, g.prop_crtc_w, g.width);
+                drmModeAtomicAddProperty(req, g.plane_id, g.prop_crtc_h, g.height);
+                if (drmModeAtomicCommit(g.drm_fd, req,
+                                        DRM_MODE_ATOMIC_NONBLOCK, &g) == 0) {
+                    g.prev_bo    = bo;
+                    g.prev_fb_id = fb_id;
+                    g.flip_pending = 1;
+                    close(fd);
+                    return;
                 }
-                gbm_bo_destroy(g.gbm, bo);
+                drmModeRmFB(g.drm_fd, fb_id);
+                drmModeAtomicFree(req);
             }
+            gbm_bo_destroy(bo);
         }
-        g.displayed = image;
-        g.pending   = NULL;
-#ifndef TARGET
-    } else {
-        // --- X11: bind EGLImage as GL texture ---
-        if (!g.gl_tex) {
-            glGenTextures(1, &g.gl_tex);
-            glBindTexture(GL_TEXTURE_2D, g.gl_tex);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        } else {
-            glBindTexture(GL_TEXTURE_2D, g.gl_tex);
-        }
-        g.gl_bind_image(GL_TEXTURE_2D, egl_img);
-        g.displayed = image;
-        g.pending   = NULL;
     }
-#endif
+    g.displayed = image;
+    g.pending   = NULL;
 
-done:
-    close(fd);
+failed:
+    if (fd >= 0) close(fd);
     g.frame_pending = 1;
 }
+#endif // HAS_DRM
 
-static void on_shm(void *data, wpe_fdo_shm_exported_buffer *buf)
+#if HAS_X11
+static void on_egl_image(void *data, struct wpe_fdo_egl_exported_image *image)
+{
+    (void)data;
+
+    if ((int)wpe_fdo_egl_exported_image_get_width(image)  != (int)g.width ||
+        (int)wpe_fdo_egl_exported_image_get_height(image) != (int)g.height) {
+        frame_wrong_size(image);
+        return;
+    }
+
+    wpe_view_backend_exportable_fdo_dispatch_frame_complete(g.exportable);
+
+    if (g.retire)
+        wpe_view_backend_exportable_fdo_egl_dispatch_release_exported_image(
+            g.exportable, g.retire);
+    g.retire  = g.displayed;
+    g.displayed = NULL;
+    if (g.pending)
+        wpe_view_backend_exportable_fdo_egl_dispatch_release_exported_image(
+            g.exportable, g.pending);
+    g.pending = NULL;
+
+    // Bind EGLImage as GL texture.
+    EGLImageKHR egl_img = wpe_fdo_egl_exported_image_get_egl_image(image);
+    if (!g.gl_tex) {
+        glGenTextures(1, &g.gl_tex);
+        glBindTexture(GL_TEXTURE_2D, g.gl_tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    } else {
+        glBindTexture(GL_TEXTURE_2D, g.gl_tex);
+    }
+    g.gl_bind_image(GL_TEXTURE_2D, egl_img);
+
+    g.displayed = image;
+    g.frame_pending = 1;
+}
+#endif // HAS_X11
+
+static void on_shm(void *data, struct wpe_fdo_shm_exported_buffer *buf)
 {
     (void)data;
     wpe_view_backend_exportable_fdo_dispatch_frame_complete(g.exportable);
@@ -445,16 +454,21 @@ static void on_shm(void *data, wpe_fdo_shm_exported_buffer *buf)
         g.exportable, buf);
 }
 
-static const wpe_view_backend_exportable_fdo_egl_client export_client = {
+static const struct wpe_view_backend_exportable_fdo_egl_client export_client = {
+#if HAS_DRM
     .export_fdo_egl_image = on_egl_image,
+#endif
+#if HAS_X11
+    .export_fdo_egl_image = on_egl_image,
+#endif
     .export_shm_buffer    = on_shm,
 };
 
 // ---------------------------------------------------------------------------
-// WebKit callbacks + init (shared)
+// WebKit init (shared)
 // ---------------------------------------------------------------------------
 
-static gboolean on_fullscreen(void *d, gboolean e) { (void)d; (void)e; return TRUE; }
+static bool on_fullscreen(void *d, bool e) { (void)d; (void)e; return true; }
 
 static WebKitWebView *on_create(WebKitWebView *v, WebKitNavigationAction *a, gpointer d)
 {
@@ -524,32 +538,48 @@ static void init_webkit(void)
 }
 
 // ---------------------------------------------------------------------------
-// DRM/KMS backend
+// DRM/KMS backend (TARGET build)
 // ---------------------------------------------------------------------------
+
+#if HAS_DRM
+static uint32_t drm_prop(uint32_t obj, uint32_t type, const char *name)
+{
+    drmModeObjectProperties *p = drmModeObjectGetProperties(g.drm_fd, obj, type);
+    if (!p) return 0;
+    for (uint32_t i = 0; i < p->count_props; i++) {
+        drmModePropertyRes *pr = drmModeGetProperty(g.drm_fd, p->props[i]);
+        if (pr) {
+            int match = strcmp(pr->name, name) == 0;
+            uint32_t id = pr->prop_id;
+            drmModeFreeProperty(pr);
+            if (match) { drmModeFreeObjectProperties(p); return id; }
+        }
+    }
+    drmModeFreeObjectProperties(p);
+    return 0;
+}
 
 static void on_page_flip(int fd, unsigned int frame, unsigned int sec,
                          unsigned int usec, void *data)
 {
     (void)fd; (void)frame; (void)sec; (void)usec; (void)data;
-    App *a = &g;
-    if (a->prev_fb_id) { drmModeRmFB(a->drm_fd, a->prev_fb_id); a->prev_fb_id = 0; }
-    if (a->prev_bo)    { gbm_bo_destroy(a->gbm, a->prev_bo);    a->prev_bo = NULL; }
-    a->flip_pending = 0;
+    if (g.prev_fb_id) { drmModeRmFB(g.drm_fd, g.prev_fb_id); g.prev_fb_id = 0; }
+    if (g.prev_bo)    { gbm_bo_destroy(g.prev_bo);    g.prev_bo = NULL; }
+    g.flip_pending = 0;
 }
 
-static drmModeEventContext drm_ctx = {
-    .version            = DRM_EVENT_CONTEXT_VERSION,
-    .page_flip_handler  = on_page_flip,
+static drmEventContext drm_ctx = {
+    .version           = DRM_EVENT_CONTEXT_VERSION,
+    .page_flip_handler = on_page_flip,
 };
 
 static int init_drm(void)
 {
-    // Find primary DRM node.
     drmDevicePtr devs[8];
     int ndev = drmGetDevices2(0, devs, 8);
     g.drm_fd = -1;
     for (int i = 0; i < ndev; i++) {
-        if (!(devs[i]->nodes & DRM_NODE_PRIMARY)) continue;
+        if (!(devs[i]->available_nodes & DRM_NODE_PRIMARY)) continue;
         int fd = open(devs[i]->nodes[DRM_NODE_PRIMARY], O_RDWR | O_CLOEXEC);
         if (fd < 0) continue;
         drmModeRes *r = drmModeGetResources(fd);
@@ -564,7 +594,6 @@ static int init_drm(void)
     drmFreeDevices(devs, ndev);
     if (g.drm_fd < 0) { fprintf(stderr, "DRM: no device\n"); return -1; }
 
-    // Active connector + preferred mode.
     drmModeRes *res = drmModeGetResources(g.drm_fd);
     drmModeConnector *conn = NULL;
     for (int i = 0; i < res->count_connectors; i++) {
@@ -588,31 +617,23 @@ static int init_drm(void)
     drmModeFreeConnector(conn);
     drmModeFreeResources(res);
 
-    // GBM device for dmabuf import.
     g.gbm = gbm_create_device(g.drm_fd);
     if (!g.gbm) return -1;
 
-    // EGL display from GBM (needed for eglExportDMABUFImageMESA).
     g.egl = eglGetPlatformDisplay(EGL_PLATFORM_GBM_MESA, g.gbm, NULL);
     if (g.egl == EGL_NO_DISPLAY) return -1;
     EGLint major, minor;
     if (!eglInitialize(g.egl, &major, &minor)) return -1;
-    g.egl_export = (PFN_eglExportDMABUFImageMESA)
-        eglGetProcAddress("eglExportDMABUFImageMESA");
-    if (!g.egl_export) { fprintf(stderr, "DRM: no eglExportDMABUFImageMESA\n"); return -1; }
 
-    // Find overlay plane for our format + CRTC.
     drmModePlaneRes *planes = drmModeGetPlaneResources(g.drm_fd);
     if (!planes) return -1;
     for (uint32_t i = 0; i < planes->count_planes; i++) {
         drmModePlane *p = drmModeGetPlane(g.drm_fd, planes->planes[i]);
         if (!p) continue;
-        // Must be compatible with our CRTC.
         uint32_t crtc_idx = 0;
-        for (uint32_t j = 0; j < res->count_crtcs; j++)
+        for (int j = 0; j < res->count_crtcs; j++)
             if (res->crtcs[j] == g.crtc_id) { crtc_idx = j; break; }
         if (!(p->possible_crtcs & (1u << crtc_idx))) { drmModeFreePlane(p); continue; }
-        // Must support our format.
         int ok = 0;
         for (uint32_t f = 0; f < p->count_formats; f++)
             if (p->formats[f] == g.format) { ok = 1; break; }
@@ -630,7 +651,6 @@ static int init_drm(void)
     drmModeFreePlaneResources(planes);
     if (!g.plane_id || !g.prop_fb_id) { fprintf(stderr, "DRM: no plane\n"); return -1; }
 
-    // Acquire DRM master + set mode.
     if (drmSetMaster(g.drm_fd)) {
         fprintf(stderr, "DRM: need root or seat for drmSetMaster\n");
         return -1;
@@ -640,13 +660,13 @@ static int init_drm(void)
             g.width, g.height, g.connector_id, g.crtc_id, g.plane_id);
     return 0;
 }
+#endif // HAS_DRM
 
 // ---------------------------------------------------------------------------
-// X11 + EGL + GLES3 backend (DEV only)
+// X11 + EGL + GLES3 backend (DEV build)
 // ---------------------------------------------------------------------------
 
-#ifndef TARGET
-
+#if HAS_X11
 static int init_x11(void)
 {
     g.x11_dpy = XOpenDisplay(NULL);
@@ -669,7 +689,7 @@ static int init_x11(void)
     };
     g.x11_win = XCreateWindow(g.x11_dpy, root, 0, 0, g.width, g.height, 0,
                               DefaultDepth(g.x11_dpy, screen), InputOutput,
-                              vis, CWColormap | CWBackgroundPixel
+                              vis, CWColormap | CWBackPixel
                               | CWEventMask | CWOverrideRedirect, &wa);
     if (!g.x11_win) return -1;
     g.x11_wm_delete = XInternAtom(g.x11_dpy, "WM_DELETE_WINDOW", False);
@@ -677,7 +697,6 @@ static int init_x11(void)
     XMapWindow(g.x11_dpy, g.x11_win);
     XFlush(g.x11_dpy);
 
-    // EGL on X11.
     EGLint n;
     const EGLint cfg_attrs[] = { EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
                                  EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, EGL_NONE };
@@ -697,13 +716,10 @@ static int init_x11(void)
     if (!g.egl_surface) return -1;
     if (!eglMakeCurrent(g.egl, g.egl_surface, g.egl_surface, g.egl_ctx)) return -1;
 
-    g.egl_export = (PFN_eglExportDMABUFImageMESA)
-        eglGetProcAddress("eglExportDMABUFImageMESA");
     g.gl_bind_image = (PFN_glEGLImageTargetTexture2DOES)
         eglGetProcAddress("glEGLImageTargetTexture2DOES");
     if (!g.gl_bind_image) return -1;
 
-    // Fullscreen blit shader.
     GLuint vs = glCreateShader(GL_VERTEX_SHADER);
     GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
     static const char *vsrc =
@@ -753,16 +769,6 @@ static void present_x11(void)
     }
 }
 
-static void cleanup_x11(void)
-{
-    if (g.gl_tex) glDeleteTextures(1, &g.gl_tex);
-    eglMakeCurrent(g.egl, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-    if (g.egl_surface) eglDestroySurface(g.egl, g.egl_surface);
-    if (g.egl_ctx)     eglDestroyContext(g.egl, g.egl_ctx);
-    if (g.x11_win)     XDestroyWindow(g.x11_dpy, g.x11_win);
-    if (g.x11_dpy)     XCloseDisplay(g.x11_dpy);
-}
-
 static void x11_event(XEvent *ev)
 {
     switch (ev->type) {
@@ -793,9 +799,10 @@ static void x11_event(XEvent *ev)
         if (ev->xkey.state & ShiftMask)   m |= 0x01;
         if (ev->xkey.state & Mod1Mask)    m |= 0x08;
         if (ev->xkey.state & Mod4Mask)    m |= 0x10;
-        wpe_input_keyboard_event w = {
+        struct wpe_input_keyboard_event w = {
             .time = (uint32_t)(g_get_monotonic_time() / 1000),
-            .key_code = sym, .keyCode = keycode ? keycode : (uint32_t)ev->xkey.keycode,
+            .key_code = sym,
+            .hardware_key_code = keycode ? keycode : (uint32_t)ev->xkey.keycode,
             .pressed = ev->type == KeyPress ? 1 : 0, .modifiers = m,
         };
         wpe_view_backend_dispatch_keyboard_event(g.backend, &w);
@@ -804,9 +811,9 @@ static void x11_event(XEvent *ev)
 
     case ButtonPress: case ButtonRelease: {
         if (ev->xbutton.button == 4 || ev->xbutton.button == 5) {
-            wpe_input_axis_2d_event ax;
+            struct wpe_input_axis_2d_event ax;
             memset(&ax, 0, sizeof ax);
-            ax.base.type = (wpe_input_axis_event_type)(
+            ax.base.type = (enum wpe_input_axis_event_type)(
                 wpe_input_axis_event_type_mask_2d | wpe_input_axis_event_type_motion_smooth);
             ax.base.time = (uint32_t)(g_get_monotonic_time() / 1000);
             ax.base.x = ev->xbutton.x; ax.base.y = ev->xbutton.y;
@@ -818,7 +825,7 @@ static void x11_event(XEvent *ev)
         uint32_t b = ev->xbutton.button <= 3 ? map[ev->xbutton.button] : (uint32_t)ev->xbutton.button;
         uint32_t s = 0;
         if (ev->type == ButtonPress) { if (b==1) s|=1<<20; if (b==2) s|=1<<21; if (b==3) s|=1<<22; }
-        wpe_input_pointer_event p = {
+        struct wpe_input_pointer_event p = {
             .type = wpe_input_pointer_event_type_button,
             .time = (uint32_t)(g_get_monotonic_time() / 1000),
             .x = ev->xbutton.x, .y = ev->xbutton.y, .button = b, .state = s,
@@ -828,7 +835,7 @@ static void x11_event(XEvent *ev)
     }
 
     case MotionNotify: {
-        wpe_input_pointer_event p = {
+        struct wpe_input_pointer_event p = {
             .type = wpe_input_pointer_event_type_motion,
             .time = (uint32_t)(g_get_monotonic_time() / 1000),
             .x = ev->xmotion.x, .y = ev->xmotion.y,
@@ -838,7 +845,8 @@ static void x11_event(XEvent *ev)
     }
 
     case ConfigureNotify:
-        if (ev->xconfigure.width != g.width || ev->xconfigure.height != g.height) {
+        if (ev->xconfigure.width != (int)g.width ||
+            ev->xconfigure.height != (int)g.height) {
             g.width  = ev->xconfigure.width;
             g.height = ev->xconfigure.height;
             wpe_view_backend_dispatch_set_size(g.backend, g.width, g.height);
@@ -847,8 +855,7 @@ static void x11_event(XEvent *ev)
     default: break;
     }
 }
-
-#endif // !TARGET
+#endif // HAS_X11
 
 // ---------------------------------------------------------------------------
 // main
@@ -861,113 +868,89 @@ int main(int argc, char **argv)
     (void)argc; (void)argv;
     memset(&g, 0, sizeof g);
     g.running  = 1;
+#if HAS_DRM
     g.drm_fd   = -1;
     g.kbd_fd   = -1;
     g.mou_fd   = -1;
+#endif
     signal(SIGTERM, on_signal);
     signal(SIGINT,  on_signal);
 
-    // --- Init display backend ---
-#ifndef TARGET
-    // Desktop: try DRM first, fall back to X11.
-    if (init_drm() == 0) {
-        g.use_drm = 1;
-        init_webkit();
-        evdev_init();
-        fprintf(stderr, "backend: DRM/KMS %ux%u\n", g.width, g.height);
-    } else {
-        // Reset DRM state, try X11.
-        if (g.drm_fd >= 0) { drmDropMaster(g.drm_fd); close(g.drm_fd); }
-        if (g.gbm) gbm_device_destroy(g.gbm);
-        memset(&g, 0, sizeof g);
-        g.running = 1; g.drm_fd = -1; g.kbd_fd = -1; g.mou_fd = -1;
-
-        if (init_x11() < 0 || init_webkit() < 0) {
-            fprintf(stderr, "error: no display backend available\n");
-            return 1;
-        }
-        g.use_drm = 0;
-        fprintf(stderr, "backend: X11+EGL %dx%d\n", g.width, g.height);
-    }
-#else
-    // Embedded: DRM only, no fallback.
-    if (init_drm() < 0 || init_webkit() < 0) {
+#if HAS_DRM
+    // Embedded: DRM/KMS only.
+    if (init_drm() < 0) {
         fprintf(stderr, "error: DRM init failed\n");
         return 1;
     }
     evdev_init();
     fprintf(stderr, "backend: DRM/KMS %ux%u\n", g.width, g.height);
-#endif
 
-#ifndef TARGET
-    if (!g.use_drm) {
-        const char *r = (const char *)glGetString(GL_RENDERER);
-        if (r) fprintf(stderr, "GL renderer: %s\n", r);
-    }
-#endif
-
-    // --- Event loop ---
     while (g.running) {
-#ifndef TARGET
-        if (g.use_drm) {
-#endif
-            // DRM + evdev: poll for input + page flip events.
-            struct pollfd fds[3];
-            nfds_t nfds = 0;
-            if (g.drm_fd >= 0)    { fds[nfds].fd = g.drm_fd;    fds[nfds].events = POLLIN; nfds++; }
-            if (g.kbd_fd >= 0)    { fds[nfds].fd = g.kbd_fd;    fds[nfds].events = POLLIN; nfds++; }
-            if (g.mou_fd >= 0)    { fds[nfds].fd = g.mou_fd;    fds[nfds].events = POLLIN; nfds++; }
-            if (nfds == 0) { usleep(50000); continue; }
-            poll(fds, nfds, 50);
-            for (nfds_t i = 0; i < nfds; i++) {
-                if (!(fds[i].revents & POLLIN)) continue;
-                if (fds[i].fd == g.drm_fd) drmHandleEvent(g.drm_fd, &drm_ctx);
-                if (fds[i].fd == g.kbd_fd) evdev_kbd_read();
-                if (fds[i].fd == g.mou_fd) evdev_mou_read();
-            }
-#ifndef TARGET
-        } else {
-            // X11: drain event queue.
-            while (XPending(g.x11_dpy)) {
-                XEvent ev;
-                XNextEvent(g.x11_dpy, &ev);
-                x11_event(&ev);
-            }
+        struct pollfd fds[3];
+        nfds_t nfds = 0;
+        if (g.drm_fd >= 0) { fds[nfds].fd = g.drm_fd;    fds[nfds].events = POLLIN; nfds++; }
+        if (g.kbd_fd >= 0) { fds[nfds].fd = g.kbd_fd;    fds[nfds].events = POLLIN; nfds++; }
+        if (g.mou_fd >= 0) { fds[nfds].fd = g.mou_fd;    fds[nfds].events = POLLIN; nfds++; }
+        if (nfds == 0) { usleep(50000); continue; }
+        poll(fds, nfds, 50);
+        for (nfds_t i = 0; i < nfds; i++) {
+            if (!(fds[i].revents & POLLIN)) continue;
+            if (fds[i].fd == g.drm_fd) drmHandleEvent(g.drm_fd, &drm_ctx);
+            if (fds[i].fd == g.kbd_fd) evdev_kbd_read();
+            if (fds[i].fd == g.mou_fd) evdev_mou_read();
         }
-#endif
 
-        // GLib/WebKit event processing.
+        while (g_main_context_pending(NULL))
+            g_main_context_iteration(NULL, FALSE);
+    }
+#else
+    // Desktop: X11+EGL+GLES3 only.
+    if (init_x11() < 0) {
+        fprintf(stderr, "error: X11 init failed\n");
+        return 1;
+    }
+    const char *r = (const char *)glGetString(GL_RENDERER);
+    if (r) fprintf(stderr, "GL renderer: %s\n", r);
+    fprintf(stderr, "backend: X11+EGL %ux%u\n", g.width, g.height);
+
+    while (g.running) {
+        while (XPending(g.x11_dpy)) {
+            XEvent ev;
+            XNextEvent(g.x11_dpy, &ev);
+            x11_event(&ev);
+        }
+
         while (g_main_context_pending(NULL))
             g_main_context_iteration(NULL, FALSE);
 
-        // Present.
         if (g.frame_pending) {
-#ifndef TARGET
-            if (g.use_drm) {
-#endif
-                // DRM: page flip happens asynchronously in the export callback.
-#ifndef TARGET
-            } else {
-                present_x11();
-            }
-#endif
+            present_x11();
             g.frame_pending = 0;
         }
     }
+#endif
 
     // --- Cleanup ---
     if (g.view) g_object_unref(g.view);
+#if HAS_DRM
+    if (g.prev_bo) gbm_bo_destroy(g.prev_bo);
+    if (g.gbm)     gbm_device_destroy(g.gbm);
+    if (g.drm_fd >= 0) {
+        drmDropMaster(g.drm_fd);
+        close(g.drm_fd);
+    }
+#endif
+#if HAS_X11
+    if (g.gl_tex) glDeleteTextures(1, &g.gl_tex);
+    eglMakeCurrent(g.egl, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    if (g.egl_surface) eglDestroySurface(g.egl, g.egl_surface);
+    if (g.egl_ctx)     eglDestroyContext(g.egl, g.egl_ctx);
+    if (g.x11_win)     XDestroyWindow(g.x11_dpy, g.x11_win);
+    if (g.x11_dpy)     XCloseDisplay(g.x11_dpy);
+#endif
     if (g.xkb_state)  xkb_state_unref(g.xkb_state);
     if (g.xkb_keymap) xkb_keymap_unref(g.xkb_keymap);
     if (g.xkb_ctx)    xkb_context_unref(g.xkb_ctx);
-
-    if (g.prev_bo)    gbm_bo_destroy(g.gbm, g.prev_bo);
-    if (g.gbm)        gbm_device_destroy(g.gbm);
-    if (g.drm_fd >= 0) { drmDropMaster(g.drm_fd); close(g.drm_fd); }
-
-#ifndef TARGET
-    if (!g.use_drm) cleanup_x11();
-#endif
 
     return 0;
 }

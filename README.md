@@ -2,27 +2,28 @@
 
 Minimal web client for [Nvidia GeForce Now](https://play.geforcenow.com/) built on **WPE WebKit + GStreamer WebRTC**.
 
-No SDL, no ImGui, no Vulkan, no OpenGL ES (except the X11 dev fallback) — pure C + DRM/KMS.
+No SDL, no ImGui, no Vulkan, no OpenGL ES (except the X11 DEV build) — pure C.
 Designed for the absolute lowest memory and CPU footprint while delivering hardware-
 accelerated cloud gaming, running fullscreen as a kiosk.
 
 ## Architecture
 
 ```
-DRM/KMS (fullscreen, direct page flip)
-   |  EGLImage → dmabuf (zero-copy)
-wpebackend-fdo 1.16.1          <- exports WebKit frames as dmabuf fds
+TARGET:  DRM/KMS (fullscreen, direct page flip)
+DEV:     X11+EGL+GLES3 (fullscreen, GL blit)
+   |  EGLImage → dmabuf / EGLImage→texture (zero-copy)
+wpebackend-fdo 1.16.1          <- exports WebKit frames
    |  WPE bridge
 WPE WebKit 2.52.6              <- WebRTC + media stream + H.264 decode
    |  webrtcbin
 GStreamer 1.26.11               <- WebRTC + VAAPI/V4L2 HW decode
 ```
 
-Two build targets:
+Two mutually exclusive build targets (no runtime fallback):
 
 | Build                  | Backend                             |
 |------------------------|-------------------------------------|
-| `DEV` (default)        | DRM/KMS primary, X11+EGL+GLES3 fallback |
+| `DEV` (default)        | X11+EGL+GLES3 only (desktop)        |
 | `TARGET` (`-DIMFN_TARGET=ON`) | DRM/KMS only (STM32MP257F, no X11, no GL) |
 
 ## Quit
