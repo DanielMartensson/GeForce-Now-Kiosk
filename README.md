@@ -84,6 +84,7 @@ cmake --build build
 |-------|---------|
 | `wpe-webkit-bwrap-unshare-net-webrtc.patch` | Let WebRTC see the host network through bubblewrap sandbox |
 | `wpe-webkit-empty-body-js-mime.patch` | Fix empty-body JS MIME type (NVIDIA login CDN) |
+| `wpe-webkit-documentloader-eventloop-include.patch` | Include EventLoop.h in DocumentLoader (unified-build fix) |
 | `gstreamer-webrtcbin-audio-opus-ptmap-fallback.patch` | Opus fallback in webrtcbin PT mapping |
 | `gstreamer-webrtcbin-balanced-to-maxbundle.patch` | Map BALANCED to MAX_BUNDLE for GFN SDP |
 

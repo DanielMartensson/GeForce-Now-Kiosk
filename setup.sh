@@ -249,6 +249,7 @@ build_wpewebkit() {
     say "WPE WebKit 2.52.6 (GeForce Now optimized)"
     apply_patch "$d" "patches/wpe-webkit-bwrap-unshare-net-webrtc.patch"
     apply_patch "$d" "patches/wpe-webkit-empty-body-js-mime.patch"
+    apply_patch "$d" "patches/wpe-webkit-documentloader-eventloop-include.patch"
 
     cmake -S "$d" -B "$d/build" -G Ninja \
         -DCMAKE_BUILD_TYPE=MinSizeRel \

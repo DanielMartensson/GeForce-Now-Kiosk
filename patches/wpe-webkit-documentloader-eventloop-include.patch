@@ -1,0 +1,17 @@
+From: GeForce-Now-Kiosk
+Subject: [PATCH] WebCore/loader/DocumentLoader: include EventLoop.h explicitly
+
+DocumentLoader.cpp calls eventLoop().queueTask(...). In the unified source
+build EventLoop stays a forward declaration and the build fails. Include
+EventLoop.h directly.
+
+--- a/Source/WebCore/loader/DocumentLoader.cpp
++++ b/Source/WebCore/loader/DocumentLoader.cpp
+@@ -52,6 +52,7 @@
+ #include "DocumentWindow.h"
+ #include "DocumentWriter.h"
+ #include "ElementChildIteratorInlines.h"
++#include "EventLoop.h"
+ #include "Event.h"
+ #include "EventNames.h"
+ #include "ExtensionStyleSheets.h"

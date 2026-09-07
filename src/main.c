@@ -256,6 +256,20 @@ static void evdev_mou_read(void)
                 };
                 wpe_view_backend_dispatch_pointer_event(g.backend, &p);
             }
+        } else if (ev.type == EV_REL && (ev.code == REL_WHEEL ||
+                                         ev.code == REL_HWHEEL)) {
+            struct wpe_input_axis_2d_event ax;
+            memset(&ax, 0, sizeof ax);
+            ax.base.type = (enum wpe_input_axis_event_type)(
+                wpe_input_axis_event_type_mask_2d
+                | wpe_input_axis_event_type_motion_smooth);
+            ax.base.time = (uint32_t)(g_get_monotonic_time() / 1000);
+            ax.base.x = mx; ax.base.y = my;
+            ax.base.modifiers = g.mods;
+            float step = ev.value > 0 ? 10.0f : -10.0f;
+            if (ev.code == REL_WHEEL) ax.y_axis = step;
+            else                     ax.x_axis = step;
+            wpe_view_backend_dispatch_axis_event(g.backend, &ax.base);
         }
     }
 }
@@ -263,20 +277,40 @@ static void evdev_mou_read(void)
 static void evdev_init(void)
 {
     g.kbd_fd = g.mou_fd = -1;
-    for (int i = 0; i < 16; i++) {
-        char path[32];
-        snprintf(path, sizeof path, "/dev/input/event%d", i);
-        int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-        if (fd < 0) continue;
-        unsigned long bits[1 + KEY_MAX / (sizeof(long) * 8)] = {};
-        if (ioctl(fd, EVIOCGBIT(0, sizeof bits), bits) < 0) {
-            close(fd); continue;
+    // Two passes: prefer devices whose names clearly say keyboard/mouse,
+    // then fall back to any device with the right capabilities.
+    for (int pass = 0; pass < 2 && (g.kbd_fd < 0 || g.mou_fd < 0); pass++) {
+        for (int i = 0; i < 16; i++) {
+            int need_kbd = g.kbd_fd < 0;
+            int need_mou = g.mou_fd < 0;
+            if (!need_kbd && !need_mou) break;
+            char path[32];
+            snprintf(path, sizeof path, "/dev/input/event%d", i);
+            int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+            if (fd < 0) continue;
+            unsigned long bits[1 + KEY_MAX / (sizeof(long) * 8)] = {};
+            if (ioctl(fd, EVIOCGBIT(0, sizeof bits), bits) < 0) {
+                close(fd); continue;
+            }
+            int has_key = bits[1 + EV_KEY  / 64] & (1UL << (EV_KEY  % 64));
+            int has_rel = bits[1 + EV_REL  / 64] & (1UL << (EV_REL  % 64));
+            int take_kbd = need_kbd && has_key;
+            int take_mou = need_mou && has_rel;
+            if (pass == 0) {
+                char name[128] = "";
+                ioctl(fd, EVIOCGNAME(sizeof name - 1), name);
+                int is_kbd = strcasestr(name, "keyboard") != NULL;
+                int is_mou = strcasestr(name, "mouse") != NULL
+                          || strcasestr(name, "touchpad") != NULL
+                          || strcasestr(name, "track")   != NULL;
+                take_kbd = need_kbd && has_key && is_kbd;
+                take_mou = need_mou && has_rel && is_mou;
+            }
+            if (take_kbd) g.kbd_fd = fd;
+            else if (take_mou) g.mou_fd = fd;
+            else close(fd);
+            if (g.kbd_fd >= 0 && g.mou_fd >= 0) break;
         }
-        int has_key = bits[1 + EV_KEY / 64] & (1UL << (EV_KEY % 64));
-        int has_rel = bits[1 + EV_REL / 64] & (1UL << (EV_REL % 64));
-        if (has_key && g.kbd_fd < 0) g.kbd_fd = fd;
-        else if (has_rel && g.mou_fd < 0) g.mou_fd = fd;
-        else close(fd);
     }
     fprintf(stderr, "evdev: kbd=%s  mou=%s\n",
             g.kbd_fd  >= 0 ? "ok" : "none",
@@ -884,6 +918,7 @@ int main(int argc, char **argv)
     }
     evdev_init();
     fprintf(stderr, "backend: DRM/KMS %ux%u\n", g.width, g.height);
+    init_webkit();
 
     while (g.running) {
         struct pollfd fds[3];
@@ -912,6 +947,7 @@ int main(int argc, char **argv)
     const char *r = (const char *)glGetString(GL_RENDERER);
     if (r) fprintf(stderr, "GL renderer: %s\n", r);
     fprintf(stderr, "backend: X11+EGL %ux%u\n", g.width, g.height);
+    init_webkit();
 
     while (g.running) {
         while (XPending(g.x11_dpy)) {
